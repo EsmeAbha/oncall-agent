@@ -1,0 +1,10 @@
+# Service catalog: what the bot needs to know to triage a service.
+services:
+  slo-service:
+    namespace: slo
+    deployment: slo-service
+    owner: "@esme"
+    replicas: 2
+    alerts: [SLOErrorBudgetFastBurn, SLOErrorBudgetSlowBurn, SLOLatencyP95High, SLOServiceMetricsAbsent]
+    dependencies: ["https://payments.internal.example.com/healthz"]   # probed by netprobe
+    endpoints: ["https://slo.example.com"]

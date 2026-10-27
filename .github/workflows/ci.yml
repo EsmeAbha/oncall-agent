@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt -r requirements-dev.txt pip-audit
+      - run: pip-audit -r requirements.txt
+      - run: pytest -q
+
+  incident-replay-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -m oncall_agent.evals --report replay.md
+      - if: always()
+        run: cat replay.md >> "$GITHUB_STEP_SUMMARY"
+
+  kubernetes:
+    # Validate the manifests, then prove the RBAC on a real cluster: the bot can do exactly
+    # what it needs and nothing more.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Schema validation
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          ./kubeconform -strict -summary deploy/kubernetes/
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: oncall
+      - name: Least-privilege checks
+        run: |
+          kubectl create namespace slo
+          kubectl apply -f deploy/kubernetes/oncall-agent.yaml
+          SA=system:serviceaccount:oncall:oncall-agent
+          can()    { test "$(kubectl auth can-i "$@" --as=$SA)" = yes || { echo "should be allowed: $*"; exit 1; }; }
+          cannot() { test "$(kubectl auth can-i "$@" --as=$SA)" = no  || { echo "should be denied: $*";  exit 1; }; }
+          can    list deployments.apps -A
+          can    list events -n kube-system
+          can    patch deployments.apps -n slo
+          can    patch deployments.apps --subresource=scale -n slo
+          can    update leases.coordination.k8s.io/oncall-agent-remediation -n oncall
+          cannot patch deployments.apps -n kube-system
+          cannot delete deployments.apps -n slo
+          cannot get secrets -n slo
+          cannot list secrets -A
+          cannot create pods --subresource=exec -n slo
+          cannot update leases.coordination.k8s.io/some-other-lease -n oncall
+          echo "RBAC is least-privilege as designed"
+
+  image:
+    needs: [test, incident-replay-gate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t oncall-agent:ci .
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: oncall-agent:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Smoke test (read-only root filesystem, as in the cluster)
+        run: |
+          docker run -d --read-only -e WEBHOOK_TOKEN=ci -p 8080:8080 oncall-agent:ci
+          for i in $(seq 1 30); do curl -sf localhost:8080/healthz && break; sleep 1; done
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8080/alertmanager -d '{}')" = "401"
+          curl -sf localhost:8080/metrics | grep -q oncall_agent_triages_total

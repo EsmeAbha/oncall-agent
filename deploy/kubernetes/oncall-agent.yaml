@@ -1,0 +1,195 @@
+# oncall-agent in its own namespace. Permissions, from least to most dangerous:
+#   cluster-wide : read deployments, replicasets, pods and events (to investigate). No Secrets.
+#   namespace slo: patch deployments and deployments/scale (to roll back / scale). Allowlisted only.
+#   own namespace: one Lease (leader election, so only one replica ever acts).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: oncall
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: oncall-agent
+  namespace: oncall
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: oncall-agent-investigate
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: oncall-agent-investigate
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: oncall-agent-investigate
+subjects:
+  - kind: ServiceAccount
+    name: oncall-agent
+    namespace: oncall
+---
+# Repeat this Role + RoleBinding for each namespace in REMEDIATE_NAMESPACES.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: oncall-agent-remediate
+  namespace: slo
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: oncall-agent-remediate
+  namespace: slo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: oncall-agent-remediate
+subjects:
+  - kind: ServiceAccount
+    name: oncall-agent
+    namespace: oncall
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: oncall-agent-lease
+  namespace: oncall
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["oncall-agent-remediation"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: oncall-agent-lease
+  namespace: oncall
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: oncall-agent-lease
+subjects:
+  - kind: ServiceAccount
+    name: oncall-agent
+    namespace: oncall
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oncall-agent-catalog
+  namespace: oncall
+data:
+  services.yaml: |
+    services:
+      slo-service:
+        namespace: slo
+        deployment: slo-service
+        replicas: 2
+        alerts: [SLOErrorBudgetFastBurn, SLOErrorBudgetSlowBurn, SLOLatencyP95High, SLOServiceMetricsAbsent]
+        dependencies: []
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oncall-agent
+  namespace: oncall
+spec:
+  replicas: 2   # both receive alerts; the Lease makes sure only one acts
+  selector:
+    matchLabels: { app: oncall-agent }
+  template:
+    metadata:
+      labels: { app: oncall-agent }
+    spec:
+      serviceAccountName: oncall-agent
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: oncall-agent
+          image: ghcr.io/esmeabha/oncall-agent:latest
+          ports: [{ containerPort: 8080, name: http }]
+          env:
+            - { name: PROMETHEUS_URL, value: "http://prometheus-operated.monitoring:9090" }
+            - { name: SERVICE_CATALOG, value: /etc/oncall/services.yaml }
+            - { name: AUTO_REMEDIATE, value: "false" }   # start in suggest-only mode; flip after a review
+            - { name: REMEDIATE_NAMESPACES, value: slo }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: WEBHOOK_TOKEN
+              valueFrom: { secretKeyRef: { name: oncall-agent, key: webhook-token } }
+            - name: SLACK_WEBHOOK_URL
+              valueFrom: { secretKeyRef: { name: oncall-agent, key: slack-webhook-url, optional: true } }
+          volumeMounts:
+            - { name: catalog, mountPath: /etc/oncall, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: catalog
+          configMap: { name: oncall-agent-catalog }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oncall-agent
+  namespace: oncall
+spec:
+  selector: { app: oncall-agent }
+  ports: [{ port: 80, targetPort: http, name: http }]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: oncall-agent
+  namespace: oncall
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: oncall-agent }
+---
+# Only Alertmanager (and Prometheus, for /metrics) may call in.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: oncall-agent
+  namespace: oncall
+spec:
+  podSelector:
+    matchLabels: { app: oncall-agent }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports: [{ port: 8080 }]

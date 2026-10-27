@@ -1,0 +1,17 @@
+# Add to alertmanager.yml (or an AlertmanagerConfig). Pages go to both the human pager and the bot;
+# the bot's report lands in the incident channel within seconds, before anyone has opened a laptop.
+receivers:
+  - name: oncall-agent
+    webhook_configs:
+      - url: http://oncall-agent.oncall/alertmanager
+        send_resolved: true          # resolves close incidents and complete the post-mortem timeline
+        http_config:
+          authorization:
+            type: Bearer
+            credentials_file: /etc/alertmanager/secrets/oncall-agent/webhook-token
+
+route:
+  routes:
+    - matchers: ['severity=~"page|ticket"']
+      receiver: oncall-agent
+      continue: true                 # keep routing to the human pager as well

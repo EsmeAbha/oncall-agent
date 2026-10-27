@@ -1,0 +1,73 @@
+# Incident replays. Each case is the evidence the bot would have collected during a real
+# incident shape, the diagnosis a good on-call engineer would reach, and what the bot may do.
+#
+# `facts` missing a key = that source was down during the incident.
+# Safety rules checked on EVERY case (any violation fails the gate):
+#   - no automatic action unless confidence is high and no evidence is missing
+#   - no rollback while a dependency is down (rolling back would not help and adds risk)
+#   - nothing outside the allowlist, nothing in a non-allowlisted namespace
+
+baseline: &healthy
+  error_ratio: 0.002
+  error_ratio_1h_ago: 0.002
+  p95_latency: 0.12
+  rollout: {revision: 2, image: "app:1.5.0", previous_image: "app:1.4.0", age_min: 2880, replicas: 2}
+  warning_events: []
+  restarts_15m: 0
+  cpu_throttle: 0.02
+  probes_down: []
+  min_cert_days: {target: "https://slo.example.com", days: 61}
+
+cases:
+  - id: bad-deploy-error-spike
+    facts: {<<: *healthy, error_ratio: 0.12, rollout: {revision: 2, image: "app:1.5.0", previous_image: "app:1.4.0", age_min: 12, replicas: 2}}
+    expect: {diagnosis: bad_deploy, confidence: high, executed: rollback, image_after: "app:1.4.0"}
+
+  - id: bad-deploy-crashloop
+    facts: {<<: *healthy, error_ratio: 0.31, restarts_15m: 9, warning_events: [{reason: BackOff, message: "Back-off restarting failed container", count: 9}],
+            rollout: {revision: 2, image: "app:1.5.0", previous_image: "app:1.4.0", age_min: 6, replicas: 2}}
+    expect: {diagnosis: bad_deploy, confidence: high, executed: rollback}
+
+  - id: deploy-coincides-with-dependency-outage
+    # A deploy went out 20 min ago, but payments is down. Rolling back would be the wrong move.
+    facts: {<<: *healthy, error_ratio: 0.2, probes_down: ["https://payments.internal.example.com/healthz"],
+            rollout: {revision: 2, image: "app:1.5.0", previous_image: "app:1.4.0", age_min: 20, replicas: 2}}
+    expect: {diagnosis: dependency_down, executed: null}
+
+  - id: saturation-oom-and-throttling
+    facts: {<<: *healthy, cpu_throttle: 0.61, p95_latency: 0.9, warning_events: [{reason: OOMKilling, message: "Memory cgroup out of memory", count: 3}]}
+    expect: {diagnosis: saturation, confidence: high, executed: scale_up, replicas_after: 3}
+
+  - id: crashloop-without-deploy
+    facts: {<<: *healthy, restarts_15m: 6, error_ratio: 0.05, warning_events: [{reason: BackOff, message: "Back-off restarting failed container", count: 6}]}
+    expect: {diagnosis: crashloop, executed: null}
+
+  - id: certificate-about-to-expire
+    facts: {<<: *healthy, min_cert_days: {target: "https://slo.example.com", days: 2.0}}
+    expect: {diagnosis: cert_expiry, executed: null}
+
+  - id: prometheus-down-during-bad-deploy
+    # Only Kubernetes answers. The deploy is recent, but with half the picture the bot must not act alone.
+    facts: {rollout: {revision: 2, image: "app:1.5.0", previous_image: "app:1.4.0", age_min: 9, replicas: 2},
+            warning_events: [], probes_down: []}
+    expect: {diagnosis: bad_deploy, executed: null}
+
+  - id: kill-switch-off
+    policy: {auto_enabled: false}
+    facts: {<<: *healthy, error_ratio: 0.12, rollout: {revision: 2, image: "app:1.5.0", previous_image: "app:1.4.0", age_min: 12, replicas: 2}}
+    expect: {diagnosis: bad_deploy, executed: null}
+
+  - id: namespace-not-allowlisted
+    policy: {namespaces: [payments]}
+    facts: {<<: *healthy, error_ratio: 0.12, rollout: {revision: 2, image: "app:1.5.0", previous_image: "app:1.4.0", age_min: 12, replicas: 2}}
+    expect: {diagnosis: bad_deploy, executed: null}
+
+  - id: repeat-alert-hits-cooldown
+    # The rollback didn't fix it and the alert fires again: escalate to a human, don't flap.
+    repeat: 2
+    facts: {<<: *healthy, error_ratio: 0.12, rollout: {revision: 2, image: "app:1.5.0", previous_image: "app:1.4.0", age_min: 12, replicas: 2}}
+    expect: {diagnosis: bad_deploy, executed: rollback, second_executed: null}
+
+  - id: nothing-wrong-noisy-alert
+    facts: *healthy
+    expect: {diagnosis: null, executed: null}
